@@ -197,6 +197,9 @@ class IndexTTS2:
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
 
+        # 添加说话人缓存
+        self.speaker_dict = {}
+
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
         vq_emb = self.semantic_model(
@@ -207,6 +210,312 @@ class IndexTTS2:
         feat = vq_emb.hidden_states[17]  # (B, T, C)
         feat = (feat - self.semantic_mean) / self.semantic_std
         return feat
+
+    @torch.no_grad()
+    def registry_speaker(self, speaker_id: str, spk_audio_path: str, emo_audio_path: str = None):
+        """
+        注册说话人，预计算并缓存特征向量
+
+        Args:
+            speaker_id (str): 说话人ID
+            spk_audio_path (str): 说话人音频路径
+            emo_audio_path (str, optional): 情感音频路径，如果不提供则使用说话人音频
+        """
+        try:
+            if emo_audio_path is None:
+                emo_audio_path = spk_audio_path
+
+            print(f"正在注册说话人: {speaker_id}")
+
+            # 处理说话人音频
+            spk_audio, sr = self._load_and_cut_audio(spk_audio_path, 15, verbose=False)
+            spk_audio_22k = torchaudio.transforms.Resample(sr, 22050)(spk_audio)
+            spk_audio_16k = torchaudio.transforms.Resample(sr, 16000)(spk_audio)
+
+            spk_inputs = self.extract_features(spk_audio_16k, sampling_rate=16000, return_tensors="pt")
+            spk_input_features = spk_inputs["input_features"].to(self.device)
+            spk_attention_mask = spk_inputs["attention_mask"].to(self.device)
+            spk_cond_emb = self.get_emb(spk_input_features, spk_attention_mask)
+
+            _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+            ref_mel = self.mel_fn(spk_audio_22k.to(spk_cond_emb.device).float())
+            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+            feat = torchaudio.compliance.kaldi.fbank(spk_audio_16k.to(ref_mel.device),
+                                                     num_mel_bins=80,
+                                                     dither=0,
+                                                     sample_frequency=16000)
+            feat = feat - feat.mean(dim=0, keepdim=True)
+            style = self.campplus_model(feat.unsqueeze(0))
+
+            prompt_condition = self.s2mel.models['length_regulator'](S_ref,
+                                                                     ylens=ref_target_lengths,
+                                                                     n_quantizers=3,
+                                                                     f0=None)[0]
+
+            # 处理情感音频
+            if emo_audio_path != spk_audio_path:
+                emo_audio, _ = self._load_and_cut_audio(emo_audio_path, 15, verbose=False, sr=16000)
+            else:
+                emo_audio = spk_audio_16k
+
+            emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+            emo_input_features = emo_inputs["input_features"].to(self.device)
+            emo_attention_mask = emo_inputs["attention_mask"].to(self.device)
+            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+
+            # 存储预计算的特征
+            self.speaker_dict[speaker_id] = {
+                "spk_cond_emb": spk_cond_emb,
+                "emo_cond_emb": emo_cond_emb,
+                "style": style,
+                "prompt_condition": prompt_condition,
+                "ref_mel": ref_mel,
+                "spk_audio_path": spk_audio_path,
+                "emo_audio_path": emo_audio_path
+            }
+
+            print(f"说话人 {speaker_id} 注册成功")
+
+        except Exception as e:
+            print(f"注册说话人 {speaker_id} 失败: {e}")
+
+    def infer_with_speaker_id(self, speaker_id: str, text: str,
+                              emo_alpha: float = 1.0,
+                              emo_vector=None,
+                              use_emo_text: bool = False,
+                              emo_text: str = None,
+                              use_random: bool = False,
+                              interval_silence: int = 200,
+                              max_text_tokens_per_segment: int = 120,
+                              **generation_kwargs):
+        """
+        使用预注册的说话人ID进行推理
+
+        Args:
+            speaker_id (str): 已注册的说话人ID
+            text (str): 要合成的文本
+            ... 其他参数与 infer 方法相同
+        """
+        if speaker_id not in self.speaker_dict:
+            raise ValueError(f"说话人 '{speaker_id}' 未注册。可用的说话人: {list(self.speaker_dict.keys())}")
+
+        speaker_data = self.speaker_dict[speaker_id]
+
+        # 使用缓存的特征进行快速推理
+        return self._infer_with_cached_features(
+            speaker_data=speaker_data,
+            text=text,
+            emo_alpha=emo_alpha,
+            emo_vector=emo_vector,
+            use_emo_text=use_emo_text,
+            emo_text=emo_text,
+            use_random=use_random,
+            interval_silence=interval_silence,
+            max_text_tokens_per_segment=max_text_tokens_per_segment,
+            **generation_kwargs
+        )
+
+    def _infer_with_cached_features(self, speaker_data, text,
+                                    emo_alpha=1.0, emo_vector=None,
+                                    use_emo_text=False, emo_text=None,
+                                    use_random=False, interval_silence=200,
+                                    max_text_tokens_per_segment=120,
+                                    **generation_kwargs):
+        """使用缓存的特征进行推理"""
+        print(">> starting inference with cached features...")
+        start_time = time.perf_counter()
+
+        if use_emo_text or emo_vector is not None:
+            # 使用文本或情感向量引导时，移除情感参考音频
+            emo_alpha = 1.0  # 重置为使用说话人音频作为情感参考
+
+        if use_emo_text:
+            if emo_text is None:
+                emo_text = text
+            emo_dict = self.qwen_emo.inference(emo_text)
+            print(f"detected emotion vectors from text: {emo_dict}")
+            emo_vector = list(emo_dict.values())
+
+        if emo_vector is not None:
+            emo_vector_scale = max(0.0, min(1.0, emo_alpha))
+            if emo_vector_scale != 1.0:
+                emo_vector = [int(x * emo_vector_scale * 10000) / 10000 for x in emo_vector]
+                print(f"scaled emotion vectors to {emo_vector_scale}x: {emo_vector}")
+
+        # 获取缓存的特征
+        spk_cond_emb = speaker_data["spk_cond_emb"]
+        emo_cond_emb = speaker_data["emo_cond_emb"]
+        style = speaker_data["style"]
+        prompt_condition = speaker_data["prompt_condition"]
+        ref_mel = speaker_data["ref_mel"]
+
+        # 处理情感向量
+        if emo_vector is not None:
+            weight_vector = torch.tensor(emo_vector).to(self.device)
+            if use_random:
+                random_index = [random.randint(0, x - 1) for x in self.emo_num]
+            else:
+                random_index = [find_most_similar_cosine(style, tmp) for tmp in self.spk_matrix]
+
+            emo_matrix = [tmp[index].unsqueeze(0) for index, tmp in zip(random_index, self.emo_matrix)]
+            emo_matrix = torch.cat(emo_matrix, 0)
+            emovec_mat = weight_vector.unsqueeze(1) * emo_matrix
+            emovec_mat = torch.sum(emovec_mat, 0)
+            emovec_mat = emovec_mat.unsqueeze(0)
+
+        # 文本处理
+        text_tokens_list = self.tokenizer.tokenize(text)
+        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment)
+        segments_count = len(segments)
+
+        # 生成参数
+        do_sample = generation_kwargs.pop("do_sample", True)
+        top_p = generation_kwargs.pop("top_p", 0.8)
+        top_k = generation_kwargs.pop("top_k", 30)
+        temperature = generation_kwargs.pop("temperature", 0.8)
+        autoregressive_batch_size = 1
+        length_penalty = generation_kwargs.pop("length_penalty", 0.0)
+        num_beams = generation_kwargs.pop("num_beams", 3)
+        repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
+        max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
+        sampling_rate = 22050
+
+        wavs = []
+        gpt_gen_time = 0
+        gpt_forward_time = 0
+        s2mel_time = 0
+        bigvgan_time = 0
+        has_warned = False
+
+        # 推理循环 - 与原 infer 方法相同的逻辑
+        for seg_idx, sent in enumerate(segments):
+            text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
+            text_tokens = torch.tensor(text_tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
+
+            m_start_time = time.perf_counter()
+            with torch.no_grad():
+                with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                    emovec = self.gpt.merge_emovec(
+                        spk_cond_emb,
+                        emo_cond_emb,
+                        torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
+                        torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                        alpha=emo_alpha
+                    )
+
+                    if emo_vector is not None:
+                        emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
+
+                    codes, speech_conditioning_latent = self.gpt.inference_speech(
+                        spk_cond_emb,
+                        text_tokens,
+                        emo_cond_emb,
+                        cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
+                        emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                        emo_vec=emovec,
+                        do_sample=True,
+                        top_p=top_p,
+                        top_k=top_k,
+                        temperature=temperature,
+                        num_return_sequences=autoregressive_batch_size,
+                        length_penalty=length_penalty,
+                        num_beams=num_beams,
+                        repetition_penalty=repetition_penalty,
+                        max_generate_length=max_mel_tokens,
+                        **generation_kwargs
+                    )
+
+                gpt_gen_time += time.perf_counter() - m_start_time
+                if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
+                    warnings.warn(
+                        f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "
+                        f"Input text tokens: {text_tokens.shape[1]}. "
+                        f"Consider reducing `max_text_tokens_per_segment`({max_text_tokens_per_segment}) or increasing `max_mel_tokens`.",
+                        category=RuntimeWarning
+                    )
+                    has_warned = True
+
+                # 处理 codes 长度
+                code_lens = []
+                for code in codes:
+                    if self.stop_mel_token not in code:
+                        code_lens.append(len(code))
+                        code_len = len(code)
+                    else:
+                        len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
+                        code_len = len_ - 1
+                    code_lens.append(code_len)
+                codes = codes[:, :code_len]
+                code_lens = torch.LongTensor(code_lens).to(self.device)
+
+                m_start_time = time.perf_counter()
+                use_speed = torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
+                with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                    latent = self.gpt(
+                        speech_conditioning_latent,
+                        text_tokens,
+                        torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
+                        codes,
+                        torch.tensor([codes.shape[-1]], device=text_tokens.device),
+                        emo_cond_emb,
+                        cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
+                        emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                        emo_vec=emovec,
+                        use_speed=use_speed,
+                    )
+                    gpt_forward_time += time.perf_counter() - m_start_time
+
+                dtype = None
+                with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
+                    m_start_time = time.perf_counter()
+                    diffusion_steps = 25
+                    inference_cfg_rate = 0.7
+                    latent = self.s2mel.models['gpt_layer'](latent)
+                    S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
+                    S_infer = S_infer.transpose(1, 2)
+                    S_infer = S_infer + latent
+                    target_lengths = (code_lens * 1.72).long()
+
+                    cond = self.s2mel.models['length_regulator'](S_infer,
+                                                                 ylens=target_lengths,
+                                                                 n_quantizers=3,
+                                                                 f0=None)[0]
+                    cat_condition = torch.cat([prompt_condition, cond], dim=1)
+                    vc_target = self.s2mel.models['cfm'].inference(cat_condition,
+                                                                   torch.LongTensor([cat_condition.size(1)]).to(
+                                                                       cond.device),
+                                                                   ref_mel, style, None, diffusion_steps,
+                                                                   inference_cfg_rate=inference_cfg_rate)
+                    vc_target = vc_target[:, :, ref_mel.size(-1):]
+                    s2mel_time += time.perf_counter() - m_start_time
+
+                    m_start_time = time.perf_counter()
+                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
+                    bigvgan_time += time.perf_counter() - m_start_time
+                    wav = wav.squeeze(1)
+
+                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+                wavs.append(wav.cpu())
+
+        end_time = time.perf_counter()
+
+        # 后处理
+        wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
+        wav = torch.cat(wavs, dim=1)
+        wav_length = wav.shape[-1] / sampling_rate
+
+        print(f">> [cached] gpt_gen_time: {gpt_gen_time:.2f} seconds")
+        print(f">> [cached] gpt_forward_time: {gpt_forward_time:.2f} seconds")
+        print(f">> [cached] s2mel_time: {s2mel_time:.2f} seconds")
+        print(f">> [cached] bigvgan_time: {bigvgan_time:.2f} seconds")
+        print(f">> [cached] Total inference time: {end_time - start_time:.2f} seconds")
+        print(f">> [cached] Generated audio length: {wav_length:.2f} seconds")
+        print(f">> [cached] RTF: {(end_time - start_time) / wav_length:.4f}")
+
+        wav = wav.cpu()
+        wav_data = wav.type(torch.int16)
+        wav_data = wav_data.numpy().T
+        return (sampling_rate, wav_data)
 
     def remove_long_silence(self, codes: torch.Tensor, silent_token=52, max_consecutive=30):
         """
