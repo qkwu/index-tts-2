@@ -144,6 +144,7 @@ def convert_audio_format(audio_tuple):
 })
 async def tts_api_v2(request: Request):
     """IndexTTS2 原生接口，支持完整的情感控制功能"""
+    global tts
     try:
         data = await request.json()
 
@@ -170,7 +171,6 @@ async def tts_api_v2(request: Request):
             "max_mel_tokens": data.get("max_mel_tokens", 1500),
         }
 
-        global tts
         audio_result = tts.infer(
             spk_audio_prompt=spk_audio_path,
             text=text,
@@ -211,6 +211,7 @@ async def tts_api_v2(request: Request):
 })
 async def tts_api(request: Request):
     """兼容接口，使用预注册的说话人"""
+    global tts
     try:
         data = await request.json()
         text = data["text"]
@@ -241,8 +242,6 @@ async def tts_api(request: Request):
             "repetition_penalty": data.get("repetition_penalty", 10.0),
             "max_mel_tokens": data.get("max_mel_tokens", 1500),
         }
-
-        global tts
         audio_result = tts.infer_with_speaker_id(
             speaker_id=character,
             text=text,
@@ -280,6 +279,7 @@ results = {}
 @app.post("/v1/tts", response_model=TTSResponse, tags=["Compatibility Endpoints"])
 async def compatible_generate_tts(request: TTSRequest, background_tasks: BackgroundTasks):
     """[兼容旧版] 异步生成TTS，返回包含音频URL的JSON响应"""
+    global tts
     task_id = str(uuid.uuid4())
     logger.info(f"Received compatible request {task_id} for speaker '{request.reference_id}'")
 
@@ -354,6 +354,7 @@ async def compatible_generate_and_return_tts_audio(request: TTSRequest, backgrou
 @app.post("/v1/tts_v2", response_model=TTSResponse, tags=["V2 Endpoints"])
 async def v2_generate_tts(request: TTSRequestV2, background_tasks: BackgroundTasks):
     """V2版本TTS接口，支持直接指定音频路径"""
+    global tts
     task_id = str(uuid.uuid4())
     logger.info(f"Received V2 request {task_id}")
 
