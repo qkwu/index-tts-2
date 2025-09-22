@@ -150,12 +150,32 @@ class IndexTTS2:
         self.campplus_model.eval()
         print(">> campplus_model weights restored from:", campplus_ckpt_path)
 
+        # 处理 BigVGAN 模型路径
         bigvgan_name = self.cfg.vocoder.name
-        self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=self.use_cuda_kernel)
+
+        # 根据配置中的模型名称，转换为本地路径
+        if bigvgan_name == "nvidia/bigvgan_v2_22khz_80band_256x":
+            bigvgan_path = os.path.join(self.model_dir, "hf_cache/nvidia/bigvgan_v2_22khz_80band_256x")
+        elif bigvgan_name.startswith("nvidia/") or bigvgan_name.startswith("facebook/"):
+            bigvgan_path = os.path.join(self.model_dir, "hf_cache", bigvgan_name)
+        else:
+            bigvgan_path = bigvgan_name
+
+        print(f"Loading BigVGAN from: {bigvgan_path}")
+
+        # 验证路径是否存在
+        if not os.path.exists(bigvgan_path):
+            raise FileNotFoundError(f"BigVGAN model not found at: {bigvgan_path}")
+
+        # 加载模型
+        self.bigvgan = bigvgan.BigVGAN.from_pretrained(
+            bigvgan_path,
+            use_cuda_kernel=self.use_cuda_kernel
+        )
         self.bigvgan = self.bigvgan.to(self.device)
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
-        print(">> bigvgan weights restored from:", bigvgan_name)
+        print(">> bigvgan weights restored from:", bigvgan_path)
 
         self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
         self.normalizer = TextNormalizer()
