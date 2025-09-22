@@ -110,8 +110,11 @@ class IndexTTS2:
 
         w2v_bert_path = os.path.join(self.model_dir, "hf_cache/facebook--w2v-bert-2.0")
         self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(w2v_bert_path)
+        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(w2v_bert_path, local_files_only=True)
         self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
-            os.path.join(self.model_dir, self.cfg.w2v_stat))
+            os.path.join(self.model_dir, self.cfg.w2v_stat),
+            model_path=w2v_bert_path  # 传递本地模型路径
+        )
         self.semantic_model = self.semantic_model.to(self.device)
         self.semantic_model.eval()
         self.semantic_mean = self.semantic_mean.to(self.device)
