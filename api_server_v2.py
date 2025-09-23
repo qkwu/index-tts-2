@@ -319,7 +319,7 @@ async def compatible_generate_tts(request: TTSRequest, background_tasks: Backgro
 
         # 保存音频文件
         output_path = os.path.join(OUTPUT_DIR, f"{task_id}.wav")
-        sf.write(output_path, wav, sr)
+        sf.write(output_path, wav, sr, subtype='PCM_16')
 
         duration = len(wav) / sr
 
@@ -390,7 +390,7 @@ async def v2_generate_tts(request: TTSRequestV2, background_tasks: BackgroundTas
 
         # 保存音频文件
         output_path = os.path.join(OUTPUT_DIR, f"{task_id}.wav")
-        sf.write(output_path, wav, sr)
+        sf.write(output_path, wav, sr, subtype='PCM_16')
 
         duration = len(wav) / sr
 
