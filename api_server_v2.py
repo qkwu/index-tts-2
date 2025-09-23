@@ -129,13 +129,55 @@ app = FastAPI(lifespan=lifespan)
 def convert_audio_format(audio_tuple):
     """将IndexTTS2返回的音频格式转换为numpy数组"""
     sampling_rate, wav_data = audio_tuple
-    if isinstance(wav_data, np.ndarray):
-        if wav_data.ndim == 2:
-            wav_data = wav_data.T  # 转置以符合soundfile格式
-        if wav_data.shape[0] == 2:  # 如果是立体声，转为单声道
+
+    print(f"DEBUG: Input audio shape: {wav_data.shape}, dtype: {wav_data.dtype}")
+
+    # 确保是numpy数组
+    if not isinstance(wav_data, np.ndarray):
+        wav_data = np.array(wav_data)
+
+    # 处理维度转换
+    if wav_data.ndim == 2:
+        # 检查是 [channels, samples] 还是 [samples, channels]
+        if wav_data.shape[0] == 2 and wav_data.shape[1] > wav_data.shape[0]:
+            # [2, samples] - 立体声，转置后取平均
             wav_data = wav_data.mean(axis=0)
-        elif wav_data.ndim == 2 and wav_data.shape[1] == 1:
+        elif wav_data.shape[1] == 2:
+            # [samples, 2] - 立体声，取平均
+            wav_data = wav_data.mean(axis=1)
+        elif wav_data.shape[0] == 1:
+            # [1, samples] - 单声道，展平
             wav_data = wav_data.flatten()
+        elif wav_data.shape[1] == 1:
+            # [samples, 1] - 单声道，展平
+            wav_data = wav_data.flatten()
+        else:
+            # 如果不确定格式，假设第一维是通道数
+            if wav_data.shape[0] < wav_data.shape[1]:
+                wav_data = wav_data.mean(axis=0)  # [channels, samples]
+            else:
+                wav_data = wav_data.mean(axis=1)  # [samples, channels]
+
+    # 确保是1维数组
+    if wav_data.ndim != 1:
+        raise ValueError(f"Cannot convert audio to 1D array, shape: {wav_data.shape}")
+
+    # 数据类型转换
+    if wav_data.dtype == np.int16:
+        # 如果是int16，转换为float32范围[-1,1]
+        wav_data = wav_data.astype(np.float32) / 32767.0
+    elif wav_data.dtype == np.int32:
+        # 如果是int32，转换为float32范围[-1,1]
+        wav_data = wav_data.astype(np.float32) / 2147483647.0
+    else:
+        # 确保是float32
+        wav_data = wav_data.astype(np.float32)
+
+    # 限制在合理范围内
+    wav_data = np.clip(wav_data, -1.0, 1.0)
+
+    print(f"DEBUG: Output audio shape: {wav_data.shape}, dtype: {wav_data.dtype}, range: [{wav_data.min():.3f}, {wav_data.max():.3f}]")
+
     return sampling_rate, wav_data
 
 @app.post("/tts_v2", responses={

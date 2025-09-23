@@ -537,6 +537,12 @@ class IndexTTS2:
         wav = wav.cpu()
         wav_data = wav.type(torch.int16)
         wav_data = wav_data.numpy().T
+
+        print(f"DEBUG: Before return - wav shape: {wav.shape}, dtype: {wav.dtype}")
+        print(f"DEBUG: wav_data shape: {wav_data.shape}, dtype: {wav_data.dtype}")
+        print(f"DEBUG: wav_data sample values: {wav_data[:10] if len(wav_data) > 10 else wav_data}")
+
+
         return (sampling_rate, wav_data)
 
     def remove_long_silence(self, codes: torch.Tensor, silent_token=52, max_consecutive=30):
