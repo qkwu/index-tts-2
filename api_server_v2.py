@@ -189,7 +189,7 @@ async def tts_api_v2(request: Request):
         sr, wav = convert_audio_format(audio_result)
 
         with io.BytesIO() as wav_buffer:
-            sf.write(wav_buffer, wav, sr, format='WAV')
+            sf.write(wav_buffer, wav, sr, format='WAV', subtype='PCM_16')
             wav_bytes = wav_buffer.getvalue()
 
         return Response(content=wav_bytes, media_type="audio/wav")
@@ -257,7 +257,7 @@ async def tts_api(request: Request):
         sr, wav = convert_audio_format(audio_result)
 
         with io.BytesIO() as wav_buffer:
-            sf.write(wav_buffer, wav, sr, format='WAV')
+            sf.write(wav_buffer, wav, sr, format='WAV', subtype='PCM_16')
             wav_bytes = wav_buffer.getvalue()
 
         return Response(content=wav_bytes, media_type="audio/wav")
