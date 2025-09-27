@@ -17,6 +17,8 @@ import numpy as np
 import soundfile as sf
 import uuid
 from fastapi import BackgroundTasks
+import time
+from concurrent.futures import ThreadPoolExecutor
 import librosa
 import torch
 import torchaudio
@@ -84,12 +86,50 @@ class TTSResponse(BaseModel):
     text: str
     sampling_rate: int
 
-# 注册的说话人缓存
-speaker_registry = {}
+class SimpleInferenceQueue:
+    """简单的推理队列"""
+
+    def __init__(self, max_workers=1):
+        self.max_workers = max_workers
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.queue_size = 0
+        self.lock = asyncio.Lock()
+
+    async def submit(self, func, *args, **kwargs):
+        """提交任务到队列"""
+        async with self.lock:
+            self.queue_size += 1
+            position = self.queue_size
+
+        logger.info(f"Task submitted to queue. Position: {position}")
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(self.executor, func, *args, **kwargs)
+            return result
+        finally:
+            async with self.lock:
+                self.queue_size -= 1
+
+    def get_queue_size(self):
+        """获取当前队列大小"""
+        return self.queue_size
+
+    def shutdown(self):
+        """关闭队列"""
+        self.executor.shutdown(wait=True)
+
+# 全局队列实例
+inference_queue = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tts
+    global tts, inference_queue, args  # 添加 args
+
+    # 初始化推理队列 (只允许1个并发任务)
+    inference_queue = SimpleInferenceQueue(max_workers=1)
+
+    # 模型加载代码
     cfg_path = os.path.join(args.model_dir, "config.yaml")
     tts = IndexTTS2(
         model_dir=args.model_dir,
@@ -98,6 +138,7 @@ async def lifespan(app: FastAPI):
         use_deepspeed=args.use_deepspeed
     )
 
+    # 说话人注册代码
     logger.info(f"正在从 '{REFERENCE_DIR}' 目录扫描并注册音色...")
     if not os.path.exists(REFERENCE_DIR):
         os.makedirs(REFERENCE_DIR)
@@ -113,8 +154,6 @@ async def lifespan(app: FastAPI):
             if audio_files:
                 spk_audio_path = audio_files[0]
                 emo_audio_path = audio_files[1] if len(audio_files) > 1 else None
-
-                # 使用新的注册方法
                 tts.registry_speaker(speaker_id, spk_audio_path, emo_audio_path)
                 speaker_count += 1
 
@@ -123,6 +162,10 @@ async def lifespan(app: FastAPI):
 
     logger.info("Application startup complete.")
     yield
+
+    # 清理资源
+    if inference_queue:
+        inference_queue.shutdown()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -185,16 +228,12 @@ def convert_audio_format(audio_tuple):
     500: {"content": {"application/json": {}}}
 })
 async def tts_api_v2(request: Request):
-    """IndexTTS2 原生接口，支持完整的情感控制功能"""
-    global tts
+    """使用队列的TTS V2接口"""
+    global tts, inference_queue
     try:
         data = await request.json()
-
-        # 必需参数
         text = data["text"]
         spk_audio_path = data["spk_audio_path"]
-
-        # 可选参数
         emo_audio_path = data.get("emo_audio_path")
         emo_alpha = data.get("emo_alpha", 1.0)
         emo_vector = data.get("emo_vector")
@@ -204,7 +243,6 @@ async def tts_api_v2(request: Request):
         interval_silence = data.get("interval_silence", 200)
         max_text_tokens_per_segment = data.get("max_text_tokens_per_segment", 120)
 
-        # 生成参数
         generation_kwargs = {
             "temperature": data.get("temperature", 0.8),
             "top_p": data.get("top_p", 0.8),
@@ -213,20 +251,33 @@ async def tts_api_v2(request: Request):
             "max_mel_tokens": data.get("max_mel_tokens", 1500),
         }
 
-        audio_result = tts.infer(
-            spk_audio_prompt=spk_audio_path,
-            text=text,
-            output_path=None,  # 直接返回音频数据
-            emo_audio_prompt=emo_audio_path,
-            emo_alpha=emo_alpha,
-            emo_vector=emo_vector,
-            use_emo_text=use_emo_text,
-            emo_text=emo_text,
-            use_random=use_random,
-            interval_silence=interval_silence,
-            max_text_tokens_per_segment=max_text_tokens_per_segment,
-            **generation_kwargs
-        )
+        # 定义推理函数
+        def inference_task():
+            start_time = time.time()
+            logger.info(f"开始处理V2推理任务: '{text[:30]}...'")
+
+            result = tts.infer(
+                spk_audio_prompt=spk_audio_path,
+                text=text,
+                output_path=None,
+                emo_audio_prompt=emo_audio_path,
+                emo_alpha=emo_alpha,
+                emo_vector=emo_vector,
+                use_emo_text=use_emo_text,
+                emo_text=emo_text,
+                use_random=use_random,
+                interval_silence=interval_silence,
+                max_text_tokens_per_segment=max_text_tokens_per_segment,
+                **generation_kwargs
+            )
+
+            inference_time = time.time() - start_time
+            logger.info(f"V2推理任务完成，耗时: {inference_time:.2f}秒")
+            return result
+
+        # 提交到队列
+        logger.info(f"提交V2推理任务到队列，当前队列长度: {inference_queue.get_queue_size()}")
+        audio_result = await inference_queue.submit(inference_task)
 
         sr, wav = convert_audio_format(audio_result)
 
@@ -238,7 +289,7 @@ async def tts_api_v2(request: Request):
 
     except Exception as ex:
         tb_str = ''.join(traceback.format_exception(type(ex), ex, ex.__traceback__))
-        logger.error(f"TTS generation failed: {tb_str}")
+        logger.error(f"TTS V2 generation failed: {tb_str}")
         return JSONResponse(
             status_code=500,
             content={
@@ -252,8 +303,8 @@ async def tts_api_v2(request: Request):
     500: {"content": {"application/json": {}}}
 })
 async def tts_api(request: Request):
-    """兼容接口，使用预注册的说话人"""
-    global tts
+    """使用队列的TTS接口"""
+    global tts, inference_queue
     try:
         data = await request.json()
         text = data["text"]
@@ -268,7 +319,7 @@ async def tts_api(request: Request):
                 }
             )
 
-        # 可选参数
+        # 准备参数
         emo_alpha = data.get("emo_alpha", 1.0)
         emo_vector = data.get("emo_vector")
         use_emo_text = data.get("use_emo_text", False)
@@ -276,7 +327,6 @@ async def tts_api(request: Request):
         interval_silence = data.get("interval_silence", 200)
         max_text_tokens_per_segment = data.get("max_text_tokens_per_segment", 120)
 
-        # 生成参数
         generation_kwargs = {
             "temperature": data.get("temperature", 0.8),
             "top_p": data.get("top_p", 0.8),
@@ -284,17 +334,31 @@ async def tts_api(request: Request):
             "repetition_penalty": data.get("repetition_penalty", 10.0),
             "max_mel_tokens": data.get("max_mel_tokens", 1500),
         }
-        audio_result = tts.infer_with_speaker_id(
-            speaker_id=character,
-            text=text,
-            emo_alpha=emo_alpha,
-            emo_vector=emo_vector,
-            use_emo_text=use_emo_text,
-            emo_text=emo_text,
-            interval_silence=interval_silence,
-            max_text_tokens_per_segment=max_text_tokens_per_segment,
-            **generation_kwargs
-        )
+
+        # 定义推理函数
+        def inference_task():
+            start_time = time.time()
+            logger.info(f"开始处理推理任务: '{text[:30]}...'")
+
+            result = tts.infer_with_speaker_id(
+                speaker_id=character,
+                text=text,
+                emo_alpha=emo_alpha,
+                emo_vector=emo_vector,
+                use_emo_text=use_emo_text,
+                emo_text=emo_text,
+                interval_silence=interval_silence,
+                max_text_tokens_per_segment=max_text_tokens_per_segment,
+                **generation_kwargs
+            )
+
+            inference_time = time.time() - start_time
+            logger.info(f"推理任务完成，耗时: {inference_time:.2f}秒")
+            return result
+
+        # 提交到队列并等待结果
+        logger.info(f"提交推理任务到队列，当前队列长度: {inference_queue.get_queue_size()}")
+        audio_result = await inference_queue.submit(inference_task)
 
         sr, wav = convert_audio_format(audio_result)
 
@@ -315,13 +379,28 @@ async def tts_api(request: Request):
             }
         )
 
-# 临时存储任务结果，用于后台清理
-results = {}
+# 添加队列状态查询接口
+@app.get("/queue/status")
+async def get_queue_status():
+    """获取队列状态"""
+    global inference_queue
+    if inference_queue:
+        return {
+            "queue_size": inference_queue.get_queue_size(),
+            "max_workers": inference_queue.max_workers,
+            "status": "running"
+        }
+    return {
+        "queue_size": 0,
+        "max_workers": 0,
+        "status": "not_initialized"
+    }
 
+# 兼容性接口 - 现在也使用队列！
 @app.post("/v1/tts", response_model=TTSResponse, tags=["Compatibility Endpoints"])
 async def compatible_generate_tts(request: TTSRequest, background_tasks: BackgroundTasks):
-    """[兼容旧版] 异步生成TTS，返回包含音频URL的JSON响应"""
-    global tts
+    """[兼容旧版] 异步生成TTS，返回包含音频URL的JSON响应 - 使用队列"""
+    global tts, inference_queue
     task_id = str(uuid.uuid4())
     logger.info(f"Received compatible request {task_id} for speaker '{request.reference_id}'")
 
@@ -344,18 +423,31 @@ async def compatible_generate_tts(request: TTSRequest, background_tasks: Backgro
             "max_mel_tokens": request.max_mel_tokens,
         }
 
-        audio_result = tts.infer_with_speaker_id(
-            speaker_id=character,
-            text=request.text,
-            emo_alpha=request.emo_alpha,
-            emo_vector=request.emo_vector,
-            use_emo_text=request.use_emo_text,
-            emo_text=request.emo_text,
-            use_random=request.use_random,
-            interval_silence=request.interval_silence,
-            max_text_tokens_per_segment=request.max_text_tokens_per_segment,
-            **generation_kwargs
-        )
+        # 定义推理任务 - 使用队列！
+        def inference_task():
+            start_time = time.time()
+            logger.info(f"开始处理兼容性推理任务: '{request.text[:30]}...'")
+
+            result = tts.infer_with_speaker_id(
+                speaker_id=character,
+                text=request.text,
+                emo_alpha=request.emo_alpha,
+                emo_vector=request.emo_vector,
+                use_emo_text=request.use_emo_text,
+                emo_text=request.emo_text,
+                use_random=request.use_random,
+                interval_silence=request.interval_silence,
+                max_text_tokens_per_segment=request.max_text_tokens_per_segment,
+                **generation_kwargs
+            )
+
+            inference_time = time.time() - start_time
+            logger.info(f"兼容性推理任务完成，耗时: {inference_time:.2f}秒")
+            return result
+
+        # 使用队列执行推理
+        logger.info(f"提交兼容性推理任务到队列，当前队列长度: {inference_queue.get_queue_size()}")
+        audio_result = await inference_queue.submit(inference_task)
 
         sr, wav = convert_audio_format(audio_result)
 
@@ -373,8 +465,8 @@ async def compatible_generate_tts(request: TTSRequest, background_tasks: Backgro
             sampling_rate=sr
         )
 
-        results[task_id] = response_data.model_dump()
-        background_tasks.add_task(lambda: results.pop(task_id, None))
+        # 清理文件的后台任务
+        background_tasks.add_task(lambda: os.remove(output_path) if os.path.exists(output_path) else None)
 
         return response_data
 
@@ -384,19 +476,18 @@ async def compatible_generate_tts(request: TTSRequest, background_tasks: Backgro
 
 @app.post("/v1/tts_audio", tags=["Compatibility Endpoints"])
 async def compatible_generate_and_return_tts_audio(request: TTSRequest, background_tasks: BackgroundTasks):
-    """[兼容旧版] 生成TTS并直接返回音频文件"""
+    """[兼容旧版] 生成TTS并直接返回音频文件 - 使用队列"""
     response_data = await compatible_generate_tts(request, background_tasks)
     task_id = response_data.id
     file_path = os.path.join(OUTPUT_DIR, f"{task_id}.wav")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Generated audio file not found.")
-    background_tasks.add_task(os.remove, file_path)
     return FileResponse(file_path, media_type="audio/wav", filename=f"{task_id}.wav")
 
 @app.post("/v1/tts_v2", response_model=TTSResponse, tags=["V2 Endpoints"])
 async def v2_generate_tts(request: TTSRequestV2, background_tasks: BackgroundTasks):
-    """V2版本TTS接口，支持直接指定音频路径"""
-    global tts
+    """V2版本TTS接口，支持直接指定音频路径 - 使用队列"""
+    global tts, inference_queue
     task_id = str(uuid.uuid4())
     logger.info(f"Received V2 request {task_id}")
 
@@ -413,20 +504,33 @@ async def v2_generate_tts(request: TTSRequestV2, background_tasks: BackgroundTas
             "max_mel_tokens": request.max_mel_tokens,
         }
 
-        audio_result = tts.infer(
-            spk_audio_prompt=request.spk_audio_path,
-            text=request.text,
-            output_path=None,
-            emo_audio_prompt=request.emo_audio_path,
-            emo_alpha=request.emo_alpha,
-            emo_vector=request.emo_vector,
-            use_emo_text=request.use_emo_text,
-            emo_text=request.emo_text,
-            use_random=request.use_random,
-            interval_silence=request.interval_silence,
-            max_text_tokens_per_segment=request.max_text_tokens_per_segment,
-            **generation_kwargs
-        )
+        # 定义推理任务 - 使用队列！
+        def inference_task():
+            start_time = time.time()
+            logger.info(f"开始处理V2兼容性推理任务: '{request.text[:30]}...'")
+
+            result = tts.infer(
+                spk_audio_prompt=request.spk_audio_path,
+                text=request.text,
+                output_path=None,
+                emo_audio_prompt=request.emo_audio_path,
+                emo_alpha=request.emo_alpha,
+                emo_vector=request.emo_vector,
+                use_emo_text=request.use_emo_text,
+                emo_text=request.emo_text,
+                use_random=request.use_random,
+                interval_silence=request.interval_silence,
+                max_text_tokens_per_segment=request.max_text_tokens_per_segment,
+                **generation_kwargs
+            )
+
+            inference_time = time.time() - start_time
+            logger.info(f"V2兼容性推理任务完成，耗时: {inference_time:.2f}秒")
+            return result
+
+        # 使用队列执行推理
+        logger.info(f"提交V2兼容性推理任务到队列，当前队列长度: {inference_queue.get_queue_size()}")
+        audio_result = await inference_queue.submit(inference_task)
 
         sr, wav = convert_audio_format(audio_result)
 
@@ -444,8 +548,8 @@ async def v2_generate_tts(request: TTSRequestV2, background_tasks: BackgroundTas
             sampling_rate=sr
         )
 
-        results[task_id] = response_data.model_dump()
-        background_tasks.add_task(lambda: results.pop(task_id, None))
+        # 清理文件的后台任务
+        background_tasks.add_task(lambda: os.remove(output_path) if os.path.exists(output_path) else None)
 
         return response_data
 
@@ -478,7 +582,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # 保持新仓库的命令行参数风格，同时可以被环境变量覆盖
-    default_model_dir = os.environ.get("TTS_MODEL_DIR", "/path/to/IndexTeam/Index-TTS")
+    default_model_dir = os.environ.get("TTS_MODEL_DIR", "checkpoints")
     default_port = int(os.environ.get("SERVICE_PORT", 11997))
 
     parser.add_argument("--host", type=str, default="0.0.0.0")
